@@ -29,15 +29,17 @@ def _send_update(
     session_id: str,
     loop: asyncio.AbstractEventLoop,
     update: Any,
-) -> None:
-    """Fire-and-forget an ACP session update from a worker thread."""
+) -> bool:
+    """Send an ACP session update from a worker thread; return whether it landed."""
     try:
         future = asyncio.run_coroutine_threadsafe(
             conn.session_update(session_id, update), loop
         )
         future.result(timeout=5)
+        return True
     except Exception:
         logger.debug("Failed to send ACP update", exc_info=True)
+        return False
 
 
 # ------------------------------------------------------------------
@@ -76,14 +78,6 @@ def make_tool_progress_cb(
             args = {}
 
         tc_id = make_tool_call_id()
-        queue = tool_call_ids.get(name)
-        if queue is None:
-            queue = deque()
-            tool_call_ids[name] = queue
-        elif isinstance(queue, str):
-            queue = deque([queue])
-            tool_call_ids[name] = queue
-        queue.append(tc_id)
 
         snapshot = None
         if name in {"write_file", "patch", "skill_manage"}:
@@ -93,10 +87,22 @@ def make_tool_progress_cb(
                 snapshot = capture_local_edit_snapshot(name, args)
             except Exception:
                 logger.debug("Failed to capture ACP edit snapshot for %s", name, exc_info=True)
-        tool_call_meta[tc_id] = {"args": args, "snapshot": snapshot}
 
         update = build_tool_start(tc_id, name, args)
-        _send_update(conn, session_id, loop, update)
+        if not _send_update(conn, session_id, loop, update):
+            # Do not enqueue an ID whose start never reached the ACP client;
+            # otherwise the later completion appears in Zed as "Tool call not found".
+            return
+
+        queue = tool_call_ids.get(name)
+        if queue is None:
+            queue = deque()
+            tool_call_ids[name] = queue
+        elif isinstance(queue, str):
+            queue = deque([queue])
+            tool_call_ids[name] = queue
+        queue.append(tc_id)
+        tool_call_meta[tc_id] = {"args": args, "snapshot": snapshot}
 
     return _tool_progress
 

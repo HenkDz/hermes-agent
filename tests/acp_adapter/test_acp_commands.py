@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -65,6 +66,19 @@ def make_agent_and_state():
     conn = CaptureConn()
     acp_agent.on_connect(conn)
     return acp_agent, state, fake, conn
+
+
+@pytest.fixture()
+def isolated_hermes_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import goals
+
+    goals._DB_CACHE.clear()
+    yield home
+    goals._DB_CACHE.clear()
 
 
 def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
@@ -196,3 +210,83 @@ async def test_acp_prompt_drains_queued_turns_after_current_run():
     assert state.queued_prompts == []
     agent_messages = [u for _sid, u in conn.updates if getattr(u, "session_update", None) == "agent_message_chunk"]
     assert len(agent_messages) >= 2
+
+
+def test_acp_advertises_high_value_slash_commands():
+    names = {command.name for command in HermesACPAgent._available_commands()}
+    assert {"goal", "status", "profile", "usage", "title", "undo", "retry"} <= names
+
+
+@pytest.mark.asyncio
+async def test_acp_goal_slash_command_sets_goal_and_runs_kickoff(isolated_hermes_home, monkeypatch):
+    acp_agent, state, fake, conn = make_agent_and_state()
+    monkeypatch.setattr(
+        acp_agent,
+        "_evaluate_goal_after_turn",
+        lambda _state, _final_response: {
+            "message": "✓ Goal achieved: done",
+            "should_continue": False,
+            "continuation_prompt": None,
+        },
+    )
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="/goal ship the patch")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert fake.runs == ["ship the patch"]
+    messages = [u for _sid, u in conn.updates if getattr(u, "session_update", None) == "agent_message_chunk"]
+    rendered = "\n".join(str(getattr(m, "content", "")) for m in messages)
+    assert "Goal set" in rendered
+
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(state.session_id)
+    assert mgr.state is not None
+    assert mgr.state.goal == "ship the patch"
+
+
+@pytest.mark.asyncio
+async def test_acp_retry_removes_last_exchange_and_reruns_prompt():
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    state.history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "done first"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "done second"},
+    ]
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="/retry")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert fake.runs == ["second"]
+    assert state.history[-2]["content"] == "second"
+    assert state.history[-1]["content"] == "ran: second"
+
+
+@pytest.mark.asyncio
+async def test_acp_undo_removes_last_exchange_without_running():
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    state.history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "done first"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "done second"},
+    ]
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="/undo")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert fake.runs == []
+    assert state.history == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "done first"},
+    ]

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import json
 import logging
 import os
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Deque, Optional
+from urllib.parse import unquote, urlparse
 
 import acp
 from acp.schema import (
@@ -18,6 +21,7 @@ from acp.schema import (
     AuthenticateResponse,
     AvailableCommand,
     AvailableCommandsUpdate,
+    BlobResourceContents,
     ClientCapabilities,
     EmbeddedResourceContentBlock,
     ForkSessionResponse,
@@ -46,6 +50,7 @@ from acp.schema import (
     SessionResumeCapabilities,
     SessionInfo,
     TextContentBlock,
+    TextResourceContents,
     UnstructuredCommandInput,
     Usage,
     UsageUpdate,
@@ -83,6 +88,179 @@ _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
 # does not expose a client-side limit, so this is a fixed cap that clients
 # paginate against using `cursor` / `next_cursor`.
 _LIST_SESSIONS_PAGE_SIZE = 50
+_MAX_ACP_RESOURCE_BYTES = 512 * 1024
+_TEXT_RESOURCE_MIME_PREFIXES = ("text/",)
+_TEXT_RESOURCE_MIME_TYPES = {
+    "application/json",
+    "application/javascript",
+    "application/typescript",
+    "application/xml",
+    "application/x-yaml",
+    "application/yaml",
+    "application/toml",
+    "application/sql",
+}
+
+
+def _resource_display_name(uri: str, name: str | None = None, title: str | None = None) -> str:
+    """Human-readable attachment name for prompt context."""
+    raw_name = (name or "").strip()
+    raw_title = (title or "").strip()
+    if raw_title and raw_name and raw_title != raw_name:
+        return f"{raw_title} ({raw_name})"
+    if raw_title:
+        return raw_title
+    if raw_name:
+        return raw_name
+    parsed = urlparse(uri)
+    candidate = parsed.path if parsed.scheme else uri
+    return Path(unquote(candidate)).name or uri or "resource"
+
+
+def _is_text_resource(mime_type: str | None) -> bool:
+    mime = (mime_type or "").split(";", 1)[0].strip().lower()
+    if not mime:
+        return False
+    return mime.startswith(_TEXT_RESOURCE_MIME_PREFIXES) or mime in _TEXT_RESOURCE_MIME_TYPES
+
+
+def _path_from_file_uri(uri: str) -> Path | None:
+    """Convert local file URIs/paths from ACP clients into a readable Path.
+
+    Zed may send POSIX file URIs from Linux/WSL workspaces or Windows-ish paths
+    when launched through wsl.exe. Translate the common Windows drive form to
+    /mnt/<drive>/... so Hermes running in WSL can read it.
+    """
+    raw = (uri or "").strip()
+    if not raw:
+        return None
+
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.scheme != "file":
+        return None
+
+    if parsed.scheme == "file":
+        if parsed.netloc and parsed.netloc not in {"", "localhost"}:
+            return None
+        path_text = unquote(parsed.path or "")
+    else:
+        path_text = unquote(raw)
+
+    # file:///C:/Users/... or C:\Users\...
+    if len(path_text) >= 3 and path_text[0] == "/" and path_text[2] == ":" and path_text[1].isalpha():
+        drive = path_text[1].lower()
+        rest = path_text[3:].lstrip("/\\").replace("\\", "/")
+        return Path("/mnt") / drive / rest
+    if len(path_text) >= 2 and path_text[1] == ":" and path_text[0].isalpha():
+        drive = path_text[0].lower()
+        rest = path_text[2:].lstrip("/\\").replace("\\", "/")
+        return Path("/mnt") / drive / rest
+
+    return Path(path_text)
+
+
+def _decode_text_bytes(data: bytes, mime_type: str | None) -> str | None:
+    """Decode resource bytes if they are probably text; return None for binary."""
+    if b"\x00" in data and not _is_text_resource(mime_type):
+        return None
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _format_resource_text(
+    *,
+    uri: str,
+    body: str,
+    name: str | None = None,
+    title: str | None = None,
+    note: str | None = None,
+) -> str:
+    display = _resource_display_name(uri, name=name, title=title)
+    header = f"[Attached file: {display}]"
+    if note:
+        header += f" ({note})"
+    return f"{header}\nURI: {uri}\n\n{body}"
+
+
+def _resource_link_to_text(block: ResourceContentBlock) -> str | None:
+    uri = str(getattr(block, "uri", "") or "").strip()
+    if not uri:
+        return None
+
+    name = str(getattr(block, "name", "") or "").strip() or None
+    title = str(getattr(block, "title", "") or "").strip() or None
+    mime_type = str(getattr(block, "mime_type", "") or "").strip() or None
+    path = _path_from_file_uri(uri)
+
+    if path is None:
+        return _format_resource_text(
+            uri=uri,
+            name=name,
+            title=title,
+            body="[Resource link only; Hermes cannot read non-file ACP resource URIs directly.]",
+        )
+
+    try:
+        size = path.stat().st_size
+        read_size = min(size, _MAX_ACP_RESOURCE_BYTES)
+        with path.open("rb") as fh:
+            data = fh.read(read_size)
+        text = _decode_text_bytes(data, mime_type)
+        if text is None:
+            return _format_resource_text(
+                uri=uri,
+                name=name,
+                title=title,
+                body=f"[Binary file omitted: {size} bytes, mime={mime_type or 'unknown'}]",
+            )
+        note = None
+        if size > _MAX_ACP_RESOURCE_BYTES:
+            note = f"truncated to {_MAX_ACP_RESOURCE_BYTES} of {size} bytes"
+        return _format_resource_text(uri=uri, name=name, title=title, body=text, note=note)
+    except OSError as exc:
+        logger.warning("ACP resource read failed: %s", uri, exc_info=True)
+        return _format_resource_text(
+            uri=uri,
+            name=name,
+            title=title,
+            body=f"[Could not read attached file: {exc}]",
+        )
+
+
+def _embedded_resource_to_text(block: EmbeddedResourceContentBlock) -> str | None:
+    resource = getattr(block, "resource", None)
+    if resource is None:
+        return None
+
+    uri = str(getattr(resource, "uri", "") or "").strip()
+    mime_type = str(getattr(resource, "mime_type", "") or "").strip() or None
+
+    if isinstance(resource, TextResourceContents):
+        return _format_resource_text(uri=uri, body=resource.text)
+
+    if isinstance(resource, BlobResourceContents):
+        blob = resource.blob or ""
+        try:
+            data = base64.b64decode(blob, validate=True)
+        except Exception:
+            data = blob.encode("utf-8", errors="replace")
+        text = _decode_text_bytes(data[:_MAX_ACP_RESOURCE_BYTES], mime_type)
+        if text is None:
+            body = f"[Binary embedded file omitted: {len(data)} bytes, mime={mime_type or 'unknown'}]"
+        else:
+            body = text
+            if len(data) > _MAX_ACP_RESOURCE_BYTES:
+                body += f"\n\n[Truncated to {_MAX_ACP_RESOURCE_BYTES} of {len(data)} bytes]"
+        return _format_resource_text(uri=uri, body=body)
+
+    text = getattr(resource, "text", None)
+    if text:
+        return _format_resource_text(uri=uri, body=str(text))
+    return None
 
 
 def _extract_text(
@@ -144,6 +322,18 @@ def _content_blocks_to_openai_user_content(
             if image_part is not None:
                 parts.append(image_part)
             continue
+        if isinstance(block, ResourceContentBlock):
+            resource_text = _resource_link_to_text(block)
+            if resource_text:
+                parts.append({"type": "text", "text": resource_text})
+                text_parts.append(resource_text)
+            continue
+        if isinstance(block, EmbeddedResourceContentBlock):
+            resource_text = _embedded_resource_to_text(block)
+            if resource_text:
+                parts.append({"type": "text", "text": resource_text})
+                text_parts.append(resource_text)
+            continue
 
     if not parts:
         return _extract_text(prompt)
@@ -162,11 +352,18 @@ class HermesACPAgent(acp.Agent):
 
     _SLASH_COMMANDS = {
         "help": "Show available commands",
+        "goal": "Set/show/pause/resume/clear a standing goal",
+        "status": "Show ACP session status",
+        "profile": "Show active Hermes profile and home",
         "model": "Show or change current model",
+        "usage": "Show persisted token usage for this session",
         "tools": "List available tools",
         "context": "Show conversation context info",
-        "reset": "Clear conversation history",
         "compact": "Compress conversation context",
+        "title": "Show or set the session title",
+        "undo": "Remove the last user/assistant exchange",
+        "retry": "Retry the last user prompt",
+        "reset": "Clear conversation history",
         "steer": "Inject guidance into the currently running agent turn",
         "queue": "Queue a prompt to run after the current turn finishes",
         "version": "Show Hermes version",
@@ -178,9 +375,26 @@ class HermesACPAgent(acp.Agent):
             "description": "List available commands",
         },
         {
+            "name": "goal",
+            "description": "Set or manage a standing goal Hermes works on across turns",
+            "input_hint": "text | status | pause | resume | clear",
+        },
+        {
+            "name": "status",
+            "description": "Show ACP session status",
+        },
+        {
+            "name": "profile",
+            "description": "Show active Hermes profile and home directory",
+        },
+        {
             "name": "model",
             "description": "Show current model and provider, or switch models",
             "input_hint": "model name to switch to",
+        },
+        {
+            "name": "usage",
+            "description": "Show persisted token usage for this session",
         },
         {
             "name": "tools",
@@ -188,15 +402,28 @@ class HermesACPAgent(acp.Agent):
         },
         {
             "name": "context",
-            "description": "Show conversation message counts by role",
-        },
-        {
-            "name": "reset",
-            "description": "Clear conversation history",
+            "description": "Show conversation context pressure and message counts",
         },
         {
             "name": "compact",
             "description": "Compress conversation context",
+        },
+        {
+            "name": "title",
+            "description": "Show or set the session title",
+            "input_hint": "title text",
+        },
+        {
+            "name": "undo",
+            "description": "Remove the last user/assistant exchange",
+        },
+        {
+            "name": "retry",
+            "description": "Retry the last user prompt",
+        },
+        {
+            "name": "reset",
+            "description": "Clear conversation history",
         },
         {
             "name": "steer",
@@ -803,6 +1030,7 @@ class HermesACPAgent(acp.Agent):
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
+        text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
         has_content = bool(user_text) or (
             isinstance(user_content, list) and bool(user_content)
         )
@@ -821,7 +1049,7 @@ class HermesACPAgent(acp.Agent):
         #      silently append to state.queued_prompts and respond with
         #      "No active turn — queued for the next turn", which looks like
         #      /queue even though the user never typed /queue.
-        if isinstance(user_content, str) and user_text.startswith("/steer"):
+        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/steer"):
             steer_text = user_text.split(maxsplit=1)[1].strip() if len(user_text.split(maxsplit=1)) > 1 else ""
             interrupted_prompt = ""
             rewrite_idle = False
@@ -846,14 +1074,30 @@ class HermesACPAgent(acp.Agent):
         # Slash commands are text-only; if the client included images/resources,
         # send the whole multimodal prompt to the agent instead of treating it as
         # an ACP command.
-        if isinstance(user_content, str) and user_text.startswith("/"):
-            response_text = self._handle_slash_command(user_text, state)
-            if response_text is not None:
-                if self._conn:
-                    update = acp.update_agent_message_text(response_text)
-                    await self._conn.session_update(session_id, update)
-                    await self._send_usage_update(state)
-                return PromptResponse(stop_reason="end_turn")
+        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
+            command_result = self._handle_slash_command(user_text, state)
+            if command_result is not None:
+                if isinstance(command_result, dict) and command_result.get("type") == "send":
+                    notice = str(command_result.get("notice") or "").strip()
+                    kickoff = str(command_result.get("message") or "").strip()
+                    if notice and self._conn:
+                        await self._conn.session_update(
+                            session_id,
+                            acp.update_agent_message_text(notice),
+                        )
+                    if kickoff:
+                        user_text = kickoff
+                        user_content = kickoff
+                    else:
+                        await self._send_usage_update(state)
+                        return PromptResponse(stop_reason="end_turn")
+                else:
+                    response_text = str(command_result)
+                    if self._conn:
+                        update = acp.update_agent_message_text(response_text)
+                        await self._conn.session_update(session_id, update)
+                        await self._send_usage_update(state)
+                    return PromptResponse(stop_reason="end_turn")
 
         # If Zed sends another regular prompt while the same ACP session is
         # still running, queue it instead of racing two AIAgent loops against
@@ -1025,6 +1269,22 @@ class HermesACPAgent(acp.Agent):
             update = acp.update_agent_message_text(final_response)
             await conn.session_update(session_id, update)
 
+        goal_followup = None
+        goal_notice = ""
+        if final_response:
+            try:
+                goal_decision = self._evaluate_goal_after_turn(state, final_response)
+                goal_notice = str(goal_decision.get("message") or "")
+                if goal_decision.get("should_continue"):
+                    goal_followup = str(goal_decision.get("continuation_prompt") or "").strip()
+            except Exception:
+                logger.debug("ACP goal continuation failed for session %s", session_id, exc_info=True)
+        if goal_notice and conn:
+            await conn.session_update(session_id, acp.update_agent_message_text(goal_notice))
+        if goal_followup:
+            with state.runtime_lock:
+                state.queued_prompts.append(goal_followup)
+
         # Mark this turn idle before draining queued work so recursive prompt()
         # calls can acquire the session. Queued turns are intentionally run as
         # normal follow-up user prompts, preserving role alternation and history.
@@ -1121,11 +1381,18 @@ class HermesACPAgent(acp.Agent):
 
         handler = {
             "help": self._cmd_help,
+            "goal": self._cmd_goal,
+            "status": self._cmd_status,
+            "profile": self._cmd_profile,
             "model": self._cmd_model,
+            "usage": self._cmd_usage,
             "tools": self._cmd_tools,
             "context": self._cmd_context,
-            "reset": self._cmd_reset,
             "compact": self._cmd_compact,
+            "title": self._cmd_title,
+            "undo": self._cmd_undo,
+            "retry": self._cmd_retry,
+            "reset": self._cmd_reset,
             "steer": self._cmd_steer,
             "queue": self._cmd_queue,
             "version": self._cmd_version,
@@ -1146,6 +1413,122 @@ class HermesACPAgent(acp.Agent):
             lines.append(f"  /{cmd:10s}  {desc}")
         lines.append("")
         lines.append("Unrecognized /commands are sent to the model as normal messages.")
+        return "\n".join(lines)
+
+    def _goal_manager(self, state: SessionState):
+        from hermes_cli.goals import DEFAULT_MAX_TURNS, GoalManager
+
+        default_max_turns = DEFAULT_MAX_TURNS
+        try:
+            from hermes_cli.config import load_config
+
+            goals_cfg = (load_config() or {}).get("goals") or {}
+            default_max_turns = int(goals_cfg.get("max_turns", DEFAULT_MAX_TURNS) or DEFAULT_MAX_TURNS)
+        except Exception:
+            logger.debug("Could not load ACP goal config", exc_info=True)
+        return GoalManager(state.session_id, default_max_turns=default_max_turns)
+
+    def _cmd_goal(self, args: str, state: SessionState) -> dict[str, str] | str:
+        """Manage a standing goal for this ACP session.
+
+        Setting a goal returns a small send payload so the slash command can show
+        a notice and then run the goal text as the first normal user prompt.
+        """
+        mgr = self._goal_manager(state)
+        arg = (args or "").strip()
+        sub = arg.lower()
+
+        if not arg or sub in {"status", "show"}:
+            return mgr.status_line()
+        if sub == "pause":
+            goal = mgr.pause("user-paused")
+            return f"⏸ Goal paused: {goal.goal}" if goal else "No active goal to pause."
+        if sub == "resume":
+            goal = mgr.resume(reset_budget=True)
+            if not goal:
+                return "No goal to resume."
+            return f"▶ Goal resumed: {goal.goal}"
+        if sub in {"clear", "stop", "done"}:
+            had_goal = mgr.has_goal()
+            mgr.clear()
+            return "Goal cleared." if had_goal else "No active goal."
+
+        goal = mgr.set(arg)
+        notice = (
+            f"⊙ Goal set ({goal.max_turns}-turn budget): {goal.goal}\n"
+            "Hermes will judge progress after each turn and continue until the goal is done. "
+            "Use /goal status, /goal pause, /goal resume, /goal clear."
+        )
+        return {"type": "send", "notice": notice, "message": goal.goal}
+
+    def _evaluate_goal_after_turn(self, state: SessionState, final_response: str) -> dict[str, Any]:
+        mgr = self._goal_manager(state)
+        return mgr.evaluate_after_turn(final_response, user_initiated=True)
+
+    def _cmd_status(self, args: str, state: SessionState) -> str:
+        model = state.model or getattr(state.agent, "model", "unknown")
+        provider = getattr(state.agent, "provider", None) or "auto"
+        title = None
+        token_total = 0
+        try:
+            db = self.session_manager._get_db()
+            title = db.get_session_title(state.session_id)
+            row = db.get_session(state.session_id) or {}
+            token_total = sum(
+                int(row.get(k) or 0)
+                for k in (
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                    "reasoning_tokens",
+                )
+            )
+        except Exception:
+            logger.debug("Could not load ACP status DB fields", exc_info=True)
+        lines = [
+            "Hermes ACP Status",
+            f"Session ID: {state.session_id}",
+            f"CWD: {state.cwd}",
+            f"Model: {model}",
+            f"Provider: {provider}",
+            f"Messages: {len(state.history)}",
+            f"Queued prompts: {len(state.queued_prompts)}",
+            f"Running: {'yes' if state.is_running else 'no'}",
+        ]
+        if title:
+            lines.insert(2, f"Title: {title}")
+        if token_total:
+            lines.append(f"Tokens: {token_total:,}")
+        try:
+            goal_line = self._goal_manager(state).status_line()
+            lines.append(f"Goal: {goal_line}")
+        except Exception:
+            pass
+        return "\n".join(lines)
+
+    def _cmd_profile(self, args: str, state: SessionState) -> str:
+        from hermes_constants import get_hermes_home
+
+        profile = os.environ.get("HERMES_PROFILE") or "default"
+        return f"Profile: {profile}\nHermes home: {get_hermes_home()}"
+
+    def _cmd_usage(self, args: str, state: SessionState) -> str:
+        try:
+            row = self.session_manager._get_db().get_session(state.session_id) or {}
+        except Exception as exc:
+            return f"Usage unavailable: {exc}"
+        fields = [
+            ("input", int(row.get("input_tokens") or 0)),
+            ("output", int(row.get("output_tokens") or 0)),
+            ("reasoning", int(row.get("reasoning_tokens") or 0)),
+            ("cache read", int(row.get("cache_read_tokens") or 0)),
+            ("cache write", int(row.get("cache_write_tokens") or 0)),
+        ]
+        total = sum(value for _name, value in fields)
+        lines = ["Token usage for this session:"]
+        lines.extend(f"  {name}: {value:,}" for name, value in fields)
+        lines.append(f"  total: {total:,}")
         return "\n".join(lines)
 
     def _cmd_model(self, args: str, state: SessionState) -> str:
@@ -1270,6 +1653,58 @@ class HermesACPAgent(acp.Agent):
             lines.append("Tip: run /compact to compress manually before the threshold.")
 
         return "\n".join(lines)
+
+    def _cmd_title(self, args: str, state: SessionState) -> str:
+        try:
+            db = self.session_manager._get_db()
+            title = (args or "").strip()
+            if not title:
+                current = db.get_session_title(state.session_id)
+                return f"Current title: {current}" if current else "No title set. Use /title <name>."
+            if db.set_session_title(state.session_id, title):
+                return f"Title set: {title}"
+            return "Could not set title: session not found."
+        except Exception as exc:
+            return f"Could not set title: {exc}"
+
+    @staticmethod
+    def _message_text(message: dict[str, Any]) -> str:
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text") or ""))
+            return "\n".join(p for p in parts if p)
+        return ""
+
+    def _last_user_message_index(self, state: SessionState) -> int | None:
+        for idx in range(len(state.history) - 1, -1, -1):
+            if state.history[idx].get("role") == "user":
+                return idx
+        return None
+
+    def _cmd_undo(self, args: str, state: SessionState) -> str:
+        idx = self._last_user_message_index(state)
+        if idx is None:
+            return "Nothing to undo."
+        removed = len(state.history) - idx
+        del state.history[idx:]
+        self.session_manager.save_session(state.session_id)
+        return f"Removed last exchange ({removed} messages)."
+
+    def _cmd_retry(self, args: str, state: SessionState) -> dict[str, str] | str:
+        idx = self._last_user_message_index(state)
+        if idx is None:
+            return "Nothing to retry."
+        prompt = self._message_text(state.history[idx]).strip()
+        if not prompt:
+            return "Last user message has no retryable text."
+        del state.history[idx:]
+        self.session_manager.save_session(state.session_id)
+        return {"type": "send", "notice": f"Retrying last prompt: {prompt[:120]}", "message": prompt}
 
     def _cmd_reset(self, args: str, state: SessionState) -> str:
         state.history.clear()
