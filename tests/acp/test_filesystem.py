@@ -135,6 +135,49 @@ async def test_write_uses_acp_client_without_local_disk_double_mutation(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_editor_resource_not_found_falls_back_to_local_disk(tmp_path):
+    disk_file = tmp_path / "example.txt"
+    disk_file.write_text("clean disk\n", encoding="utf-8")
+    client = FakeACPClient(fail=RuntimeError("Resource not found"))
+    task_id = f"acp-fs-resource-miss-{uuid.uuid4()}"
+
+    raw = await _with_acp_context(
+        lambda: read_file_tool(str(disk_file), task_id=task_id),
+        client=client,
+        session_id="session-1",
+        cwd=tmp_path,
+        capabilities=_caps(read=True),
+    )
+
+    payload = json.loads(raw)
+    assert "clean disk" in payload["content"]
+    assert "error" not in payload
+    assert client.read_calls
+
+
+@pytest.mark.asyncio
+async def test_editor_write_internal_error_falls_back_to_local_disk(tmp_path):
+    disk_file = tmp_path / "example.txt"
+    disk_file.write_text("original disk\n", encoding="utf-8")
+    client = FakeACPClient(fail=RuntimeError("Internal error"))
+    task_id = f"acp-fs-write-fallback-{uuid.uuid4()}"
+
+    raw = await _with_acp_context(
+        lambda: write_file_tool(str(disk_file), "local fallback\n", task_id=task_id),
+        client=client,
+        session_id="session-1",
+        cwd=tmp_path,
+        capabilities=_caps(write=True),
+    )
+
+    payload = json.loads(raw)
+    assert payload["bytes_written"] == len("local fallback\n".encode("utf-8"))
+    assert "error" not in payload
+    assert disk_file.read_text(encoding="utf-8") == "local fallback\n"
+    assert client.write_calls
+
+
+@pytest.mark.asyncio
 async def test_acp_failure_returns_clear_error_without_local_fallback(tmp_path):
     disk_file = tmp_path / "example.txt"
     disk_file.write_text("clean disk\n", encoding="utf-8")
