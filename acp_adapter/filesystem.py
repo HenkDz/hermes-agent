@@ -110,6 +110,20 @@ def _add_line_numbers(content: str, offset: int) -> str:
     return "\n".join(f"{offset + idx:6d}|{line}" for idx, line in enumerate(lines))
 
 
+def _should_fallback_to_local_filesystem(exc: Exception) -> bool:
+    """Return True when the ACP editor filesystem could not handle the path.
+
+    Some clients advertise fs/read_text_file or fs/write_text_file for dirty
+    buffer access but only serve files they have materialized in the editor
+    resource layer. Zed can also return a generic internal error for writes to
+    paths it does not own. In those cases, normal local disk reads/writes should
+    still work via the existing fallback path.
+    """
+
+    message = str(exc).lower()
+    return "resource not found" in message or "internal error" in message
+
+
 def read_text_file(path: str, offset: int = 1, limit: int = 500) -> ReadResult | None:
     """Read through ACP fs/read_text_file if active and supported.
 
@@ -143,6 +157,8 @@ def read_text_file(path: str, offset: int = 1, limit: int = 500) -> ReadResult |
             truncated=False,
         )
     except Exception as exc:
+        if _should_fallback_to_local_filesystem(exc):
+            return None
         return ReadResult(error=f"ACP editor filesystem read failed for '{abs_path}': {exc}")
 
 
@@ -172,4 +188,6 @@ def write_text_file(path: str, content: str) -> WriteResult | None:
             warning="Wrote via ACP editor filesystem; local disk fallback was not used.",
         )
     except Exception as exc:
+        if _should_fallback_to_local_filesystem(exc):
+            return None
         return WriteResult(error=f"ACP editor filesystem write failed for '{abs_path}': {exc}")
