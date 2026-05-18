@@ -12,7 +12,7 @@ from acp.schema import ClientCapabilities, FileSystemCapabilities
 
 from acp_adapter import filesystem as acp_filesystem
 from acp_adapter.server import HermesACPAgent
-from tools.file_tools import read_file_tool, write_file_tool
+from tools.file_tools import patch_tool, read_file_tool, write_file_tool
 
 
 class FakeACPClient:
@@ -123,7 +123,7 @@ async def test_write_uses_acp_client_without_local_disk_double_mutation(tmp_path
 
     payload = json.loads(raw)
     assert payload["bytes_written"] == len("editor content\n".encode("utf-8"))
-    assert "ACP editor filesystem" in payload["warning"]
+    assert "warning" not in payload
     assert disk_file.read_text(encoding="utf-8") == "original disk\n"
     assert client.write_calls == [
         {
@@ -175,6 +175,91 @@ async def test_editor_write_internal_error_falls_back_to_local_disk(tmp_path):
     assert "error" not in payload
     assert disk_file.read_text(encoding="utf-8") == "local fallback\n"
     assert client.write_calls
+
+
+@pytest.mark.asyncio
+async def test_repeated_acp_read_refetches_dirty_buffer_instead_of_deduping(tmp_path):
+    disk_file = tmp_path / "example.txt"
+    disk_file.write_text("clean disk\n", encoding="utf-8")
+    client = FakeACPClient(read_content="dirty v1\n")
+    task_id = f"acp-fs-read-dedup-{uuid.uuid4()}"
+
+    async def run_once():
+        return await _with_acp_context(
+            lambda: read_file_tool(str(disk_file), offset=1, limit=5, task_id=task_id),
+            client=client,
+            session_id="session-1",
+            cwd=tmp_path,
+            capabilities=_caps(read=True),
+        )
+
+    first = json.loads(await run_once())
+    client.read_content = "dirty v2\n"
+    second = json.loads(await run_once())
+
+    assert "dirty v1" in first["content"]
+    assert "dirty v2" in second["content"]
+    assert second.get("status") != "unchanged"
+    assert len(client.read_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_patch_replace_uses_acp_dirty_buffer_and_write(tmp_path):
+    disk_file = tmp_path / "example.txt"
+    disk_file.write_text("clean disk old\n", encoding="utf-8")
+    client = FakeACPClient(read_content="dirty buffer old\n")
+    task_id = f"acp-fs-patch-replace-{uuid.uuid4()}"
+
+    raw = await _with_acp_context(
+        lambda: patch_tool(
+            mode="replace",
+            path=str(disk_file),
+            old_string="dirty buffer old",
+            new_string="dirty buffer new",
+            task_id=task_id,
+        ),
+        client=client,
+        session_id="session-1",
+        cwd=tmp_path,
+        capabilities=_caps(read=True, write=True),
+    )
+
+    payload = json.loads(raw)
+    assert payload["success"] is True
+    assert "dirty buffer new" in payload["diff"]
+    assert disk_file.read_text(encoding="utf-8") == "clean disk old\n"
+    assert client.write_calls[-1]["content"] == "dirty buffer new\n"
+
+
+@pytest.mark.asyncio
+async def test_patch_v4a_uses_acp_dirty_buffer_and_write(tmp_path):
+    disk_file = tmp_path / "example.txt"
+    disk_file.write_text("clean disk old\n", encoding="utf-8")
+    client = FakeACPClient(read_content="alpha\nold\nomega\n")
+    task_id = f"acp-fs-patch-v4a-{uuid.uuid4()}"
+    patch = """*** Begin Patch
+*** Update File: example.txt
+@@ old @@
+ alpha
+-old
++new
+ omega
+*** End Patch
+"""
+
+    raw = await _with_acp_context(
+        lambda: patch_tool(mode="patch", patch=patch, task_id=task_id),
+        client=client,
+        session_id="session-1",
+        cwd=tmp_path,
+        capabilities=_caps(read=True, write=True),
+    )
+
+    payload = json.loads(raw)
+    assert payload["success"] is True
+    assert "new" in payload["diff"]
+    assert disk_file.read_text(encoding="utf-8") == "clean disk old\n"
+    assert client.write_calls[-1]["content"] == "alpha\nnew\nomega\n"
 
 
 @pytest.mark.asyncio

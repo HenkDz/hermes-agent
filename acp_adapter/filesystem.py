@@ -12,12 +12,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import difflib
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
-from tools.file_operations import ReadResult, WriteResult, normalize_read_pagination
+from tools.file_operations import PatchResult, ReadResult, WriteResult, normalize_read_pagination
 
 
 @dataclass(frozen=True)
@@ -110,6 +111,13 @@ def _add_line_numbers(content: str, offset: int) -> str:
     return "\n".join(f"{offset + idx:6d}|{line}" for idx, line in enumerate(lines))
 
 
+def acp_read_active() -> bool:
+    """Return True when file tools are running with ACP read support."""
+
+    ctx = current_context()
+    return bool(ctx and ctx.can_read)
+
+
 def _should_fallback_to_local_filesystem(exc: Exception) -> bool:
     """Return True when the ACP editor filesystem could not handle the path.
 
@@ -162,6 +170,38 @@ def read_text_file(path: str, offset: int = 1, limit: int = 500) -> ReadResult |
         return ReadResult(error=f"ACP editor filesystem read failed for '{abs_path}': {exc}")
 
 
+def read_text_file_raw(path: str) -> ReadResult | None:
+    """Read a whole file through ACP fs/read_text_file for patch operations."""
+
+    ctx = current_context()
+    if ctx is None or not ctx.can_read:
+        return None
+    abs_path = _absolute_path(path, ctx.cwd)
+    try:
+        response = _run_client_coro(
+            ctx,
+            ctx.client.read_text_file(
+                path=abs_path,
+                session_id=ctx.session_id,
+                limit=1_000_000,
+                line=1,
+            ),
+        )
+        content = getattr(response, "content", "")
+        if not isinstance(content, str):
+            content = str(content or "")
+        return ReadResult(
+            content=content,
+            total_lines=len(content.splitlines()),
+            file_size=len(content.encode("utf-8")),
+            truncated=False,
+        )
+    except Exception as exc:
+        if _should_fallback_to_local_filesystem(exc):
+            return None
+        return ReadResult(error=f"ACP editor filesystem read failed for '{abs_path}': {exc}")
+
+
 def write_text_file(path: str, content: str) -> WriteResult | None:
     """Write through ACP fs/write_text_file if active and supported.
 
@@ -185,9 +225,100 @@ def write_text_file(path: str, content: str) -> WriteResult | None:
         return WriteResult(
             bytes_written=len(content.encode("utf-8")),
             dirs_created=False,
-            warning="Wrote via ACP editor filesystem; local disk fallback was not used.",
         )
     except Exception as exc:
         if _should_fallback_to_local_filesystem(exc):
             return None
         return WriteResult(error=f"ACP editor filesystem write failed for '{abs_path}': {exc}")
+
+class _ACPFileOperations:
+    """Minimal file-operations adapter backed by ACP read/write requests."""
+
+    def read_file_raw(self, path: str) -> ReadResult:
+        result = read_text_file_raw(path)
+        if result is None:
+            return ReadResult(error="ACP editor filesystem is not available for this file")
+        return result
+
+    def write_file(self, path: str, content: str) -> WriteResult:
+        result = write_text_file(path, content)
+        if result is None:
+            return WriteResult(error="ACP editor filesystem is not available for this file")
+        return result
+
+    def delete_file(self, path: str) -> WriteResult:
+        return WriteResult(error="ACP editor filesystem does not support delete operations")
+
+    def move_file(self, src: str, dst: str) -> WriteResult:
+        return WriteResult(error="ACP editor filesystem does not support move operations")
+
+
+def _unified_diff(path: str, before: str, after: str) -> str:
+    return "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+        )
+    )
+
+
+def patch_replace(path: str, old_string: str, new_string: str, replace_all: bool = False) -> PatchResult | None:
+    """Apply replace-mode patch through ACP read/write when available."""
+
+    ctx = current_context()
+    if ctx is None or not (ctx.can_read and ctx.can_write):
+        return None
+    read_result = read_text_file_raw(path)
+    if read_result is None:
+        return None
+    if read_result.error:
+        return PatchResult(error=read_result.error)
+
+    from tools.fuzzy_match import fuzzy_find_and_replace
+
+    content = read_result.content or ""
+    new_content, match_count, _strategy, error = fuzzy_find_and_replace(
+        content, old_string, new_string, replace_all
+    )
+    if error or match_count == 0:
+        err_msg = error or f"Could not find match for old_string in {path}"
+        try:
+            from tools.fuzzy_match import format_no_match_hint
+
+            err_msg += format_no_match_hint(err_msg, match_count, old_string, content)
+        except Exception:
+            pass
+        return PatchResult(error=err_msg)
+
+    write_result = write_text_file(path, new_content)
+    if write_result is None:
+        return None
+    if write_result.error:
+        return PatchResult(error=f"Failed to write changes: {write_result.error}")
+
+    return PatchResult(
+        success=True,
+        diff=_unified_diff(path, content, new_content),
+        files_modified=[path],
+        lsp_diagnostics=write_result.lsp_diagnostics,
+    )
+
+
+def patch_v4a(patch_content: str) -> PatchResult | None:
+    """Apply V4A patch updates/adds through ACP read/write when available."""
+
+    ctx = current_context()
+    if ctx is None or not (ctx.can_read and ctx.can_write):
+        return None
+
+    from tools.patch_parser import OperationType, apply_v4a_operations, parse_v4a_patch
+
+    operations, parse_error = parse_v4a_patch(patch_content)
+    if parse_error:
+        return PatchResult(error=f"Failed to parse patch: {parse_error}")
+    if any(op.operation in {OperationType.DELETE, OperationType.MOVE} for op in operations):
+        return None
+    return apply_v4a_operations(operations, _ACPFileOperations())
+

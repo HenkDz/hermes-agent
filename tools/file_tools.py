@@ -581,6 +581,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # file hasn't been modified since, return a lightweight stub
         # instead of re-sending the same content.  Saves context tokens.
         resolved_str = str(_resolved)
+        acp_read_active = bool(acp_filesystem and acp_filesystem.acp_read_active())
         dedup_key = (resolved_str, offset, limit)
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
@@ -597,7 +598,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 task_data["read_timestamps"] = {}
             cached_mtime = task_data.get("dedup", {}).get(dedup_key)
 
-        if cached_mtime is not None:
+        if cached_mtime is not None and not acp_read_active:
             try:
                 current_mtime = os.path.getmtime(resolved_str)
                 if current_mtime == cached_mtime:
@@ -1052,11 +1053,15 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return tool_error("path required")
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
-                result = file_ops.patch_replace(path, old_string, new_string, replace_all)
+                result = acp_filesystem.patch_replace(path, old_string, new_string, replace_all) if acp_filesystem else None
+                if result is None:
+                    result = file_ops.patch_replace(path, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                result = acp_filesystem.patch_v4a(patch) if acp_filesystem else None
+                if result is None:
+                    result = file_ops.patch_v4a(patch)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
