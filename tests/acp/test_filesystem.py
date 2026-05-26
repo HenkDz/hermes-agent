@@ -75,6 +75,7 @@ async def test_dirty_buffer_read_uses_acp_client(tmp_path):
     payload = json.loads(raw)
     assert "dirty buffer" in payload["content"]
     assert "clean disk" not in payload["content"]
+    assert payload["_filesystem"] == {"route": "acp_editor"}
     assert client.read_calls == [
         {
             "path": str(disk_file),
@@ -103,6 +104,7 @@ def test_no_capability_read_falls_back_to_local_disk(tmp_path):
     raw = asyncio.run(run())
     payload = json.loads(raw)
     assert "clean disk" in payload["content"]
+    assert payload["_filesystem"] == {"route": "local_disk_no_editor_read"}
     assert client.read_calls == []
 
 
@@ -123,6 +125,7 @@ async def test_write_uses_acp_client_without_local_disk_double_mutation(tmp_path
 
     payload = json.loads(raw)
     assert payload["bytes_written"] == len("editor content\n".encode("utf-8"))
+    assert payload["_filesystem"] == {"route": "acp_editor"}
     assert "warning" not in payload
     assert disk_file.read_text(encoding="utf-8") == "original disk\n"
     assert client.write_calls == [
@@ -151,6 +154,7 @@ async def test_editor_resource_not_found_falls_back_to_local_disk(tmp_path):
 
     payload = json.loads(raw)
     assert "clean disk" in payload["content"]
+    assert payload["_filesystem"] == {"route": "local_disk_fallback"}
     assert "error" not in payload
     assert client.read_calls
 
@@ -172,6 +176,7 @@ async def test_editor_write_internal_error_falls_back_to_local_disk(tmp_path):
 
     payload = json.loads(raw)
     assert payload["bytes_written"] == len("local fallback\n".encode("utf-8"))
+    assert payload["_filesystem"] == {"route": "local_disk_fallback"}
     assert "error" not in payload
     assert disk_file.read_text(encoding="utf-8") == "local fallback\n"
     assert client.write_calls
@@ -226,6 +231,7 @@ async def test_patch_replace_uses_acp_dirty_buffer_and_write(tmp_path):
 
     payload = json.loads(raw)
     assert payload["success"] is True
+    assert payload["_filesystem"] == {"route": "acp_editor"}
     assert "dirty buffer new" in payload["diff"]
     assert disk_file.read_text(encoding="utf-8") == "clean disk old\n"
     assert client.write_calls[-1]["content"] == "dirty buffer new\n"
@@ -257,6 +263,7 @@ async def test_patch_v4a_uses_acp_dirty_buffer_and_write(tmp_path):
 
     payload = json.loads(raw)
     assert payload["success"] is True
+    assert payload["_filesystem"] == {"route": "acp_editor"}
     assert "new" in payload["diff"]
     assert disk_file.read_text(encoding="utf-8") == "clean disk old\n"
     assert client.write_calls[-1]["content"] == "alpha\nnew\nomega\n"

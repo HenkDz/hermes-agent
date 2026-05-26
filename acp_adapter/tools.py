@@ -285,6 +285,21 @@ def _format_todo_result(result: Optional[str]) -> Optional[str]:
     return "\n".join(lines)
 
 
+def _filesystem_route_label(data: Dict[str, Any]) -> str | None:
+    fs = data.get("_filesystem")
+    if not isinstance(fs, dict):
+        return None
+    route = str(fs.get("route") or "").strip()
+    labels = {
+        "acp_editor": "Zed editor filesystem",
+        "local_disk_fallback": "local disk fallback",
+        "local_disk_no_editor_read": "local disk (Zed read unavailable)",
+        "local_disk_no_editor_write": "local disk (Zed write unavailable)",
+        "local_disk_no_editor_patch": "local disk (Zed read/write unavailable)",
+    }
+    return labels.get(route, route or None)
+
+
 def _format_read_file_result(result: Optional[str], args: Optional[Dict[str, Any]]) -> Optional[str]:
     data = _json_loads_maybe(result)
     if not isinstance(data, dict):
@@ -306,6 +321,9 @@ def _format_read_file_result(result: Optional[str], args: Optional[Dict[str, Any
     header = f"Read {path}{suffix}"
     if data.get("total_lines") is not None:
         header += f" — {data.get('total_lines')} total lines"
+    route = _filesystem_route_label(data)
+    if route:
+        header += f" — {route}"
     # Hermes read_file output is line-numbered with `|`. If we send it as raw
     # Markdown, Zed can interpret pipes as tables and collapse the layout.
     # Fence the payload so file lines stay readable and literal.
@@ -677,6 +695,9 @@ def _format_edit_result(tool_name: str, result: Optional[str], args: Optional[Di
             lines.append(message)
         if replacements is not None:
             lines.append(f"Replacements: {replacements}")
+        route = _filesystem_route_label(data)
+        if route:
+            lines.append(f"Filesystem: {route}")
         if data.get("files_modified"):
             files = data.get("files_modified")
             if isinstance(files, list):

@@ -421,12 +421,25 @@ class TestBuildToolComplete:
         result = build_tool_complete(
             "tc-read",
             "read_file",
-            '{"content":"1|hello\\n2|world","total_lines":2}',
+            '{"content":"1|hello\\n2|world","total_lines":2,"_filesystem":{"route":"acp_editor"}}',
             function_args={"path":"README.md","offset":1,"limit":20},
         )
         text = result.content[0].content.text
         assert "Read README.md" in text
+        assert "Zed editor filesystem" in text
         assert "```\n1|hello\n2|world\n```" in text
+        assert result.raw_output is None
+
+    def test_build_tool_complete_for_patch_formats_filesystem_route(self):
+        result = build_tool_complete(
+            "tc-patch-route",
+            "patch",
+            '{"success":true,"files_modified":["README.md"],"_filesystem":{"route":"local_disk_fallback"}}',
+            function_args={"path":"README.md","mode":"replace"},
+        )
+        text = result.content[0].content.text
+        assert "✅ patch completed" in text
+        assert "Filesystem: local disk fallback" in text
         assert result.raw_output is None
 
     def test_build_tool_complete_for_search_files_formats_matches(self):

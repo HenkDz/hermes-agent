@@ -26,6 +26,26 @@ except Exception:  # pragma: no cover - ACP extra may be unavailable in non-ACP 
 logger = logging.getLogger(__name__)
 
 
+def _active_acp_filesystem_context():
+    """Return the bound ACP filesystem context, if any.
+
+    Kept local to file tools so non-ACP installs keep importing even when the
+    optional ACP adapter is unavailable.
+    """
+    if not acp_filesystem:
+        return None
+    try:
+        return acp_filesystem.current_context()
+    except Exception:
+        return None
+
+
+def _record_filesystem_route(result_dict: dict, route: str | None) -> None:
+    """Attach editor/local filesystem route metadata for ACP-visible results."""
+    if route:
+        result_dict["_filesystem"] = {"route": route}
+
+
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 
 # ---------------------------------------------------------------------------
@@ -641,11 +661,17 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # In ACP editor sessions, prefer the client's filesystem so reads see
         # unsaved/dirty editor buffers. Non-ACP sessions and ACP clients that
         # did not advertise fs/read_text_file fall back unchanged.
+        acp_ctx = _active_acp_filesystem_context()
+        acp_attempted = bool(acp_ctx and getattr(acp_ctx, "can_read", False))
         result = acp_filesystem.read_text_file(path, offset, limit) if acp_filesystem else None
+        filesystem_route = "acp_editor" if result is not None else None
         if result is None:
             file_ops = _get_file_ops(task_id)
             result = file_ops.read_file(path, offset, limit)
+            if acp_ctx is not None:
+                filesystem_route = "local_disk_fallback" if acp_attempted else "local_disk_no_editor_read"
         result_dict = result.to_dict()
+        _record_filesystem_route(result_dict, filesystem_route)
 
         # ── Character-count guard ─────────────────────────────────────
         # We're model-agnostic so we can't count tokens; characters are
@@ -926,11 +952,17 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
+            acp_ctx = _active_acp_filesystem_context()
+            acp_attempted = bool(acp_ctx and getattr(acp_ctx, "can_write", False))
             result = acp_filesystem.write_text_file(path, content) if acp_filesystem else None
+            filesystem_route = "acp_editor" if result is not None else None
             if result is None:
                 file_ops = _get_file_ops(task_id)
                 result = file_ops.write_file(path, content)
+                if acp_ctx is not None:
+                    filesystem_route = "local_disk_fallback" if acp_attempted else "local_disk_no_editor_write"
             result_dict = result.to_dict()
+            _record_filesystem_route(result_dict, filesystem_route)
             if stale_warning:
                 result_dict["_warning"] = stale_warning
             _update_read_timestamp(path, task_id)
@@ -944,11 +976,17 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
             stale_warning = _check_file_staleness(path, task_id)
+            acp_ctx = _active_acp_filesystem_context()
+            acp_attempted = bool(acp_ctx and getattr(acp_ctx, "can_write", False))
             result = acp_filesystem.write_text_file(path, content) if acp_filesystem else None
+            filesystem_route = "acp_editor" if result is not None else None
             if result is None:
                 file_ops = _get_file_ops(task_id)
                 result = file_ops.write_file(path, content)
+                if acp_ctx is not None:
+                    filesystem_route = "local_disk_fallback" if acp_attempted else "local_disk_no_editor_write"
             result_dict = result.to_dict()
+            _record_filesystem_route(result_dict, filesystem_route)
             effective_warning = cross_warning or stale_warning
             if effective_warning:
                 result_dict["_warning"] = effective_warning
@@ -1048,24 +1086,38 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
 
             file_ops = _get_file_ops(task_id)
 
+            acp_ctx = _active_acp_filesystem_context()
+            acp_attempted = bool(
+                acp_ctx
+                and getattr(acp_ctx, "can_read", False)
+                and getattr(acp_ctx, "can_write", False)
+            )
+            filesystem_route = None
             if mode == "replace":
                 if not path:
                     return tool_error("path required")
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
                 result = acp_filesystem.patch_replace(path, old_string, new_string, replace_all) if acp_filesystem else None
+                filesystem_route = "acp_editor" if result is not None else None
                 if result is None:
                     result = file_ops.patch_replace(path, old_string, new_string, replace_all)
+                    if acp_ctx is not None:
+                        filesystem_route = "local_disk_fallback" if acp_attempted else "local_disk_no_editor_patch"
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
                 result = acp_filesystem.patch_v4a(patch) if acp_filesystem else None
+                filesystem_route = "acp_editor" if result is not None else None
                 if result is None:
                     result = file_ops.patch_v4a(patch)
+                    if acp_ctx is not None:
+                        filesystem_route = "local_disk_fallback" if acp_attempted else "local_disk_no_editor_patch"
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
             result_dict = result.to_dict()
+            _record_filesystem_route(result_dict, filesystem_route)
             if stale_warnings:
                 result_dict["_warning"] = stale_warnings[0] if len(stale_warnings) == 1 else " | ".join(stale_warnings)
             # Refresh stored timestamps for all successfully-patched paths so
